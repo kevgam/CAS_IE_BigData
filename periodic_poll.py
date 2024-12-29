@@ -21,7 +21,7 @@ engine = create_engine(
 # ----------------------------
 # 2) DEFINITION OF EXECUTION PERIOD (in minutes)
 # ----------------------------
-execution_period = 1  # <--- adjust this to how many minutes you want
+execution_period = 1440  # <--- adjust this to how many minutes you want
 
 # ----------------------------
 # 3) PERIODIC STATUS POLL (DYNAMIC)
@@ -31,89 +31,68 @@ STATUS_DATA_URL = (
     "status/oicp/ch.bfe.ladestellen-elektromobilitaet.json"
 )
 
-def get_station_id(conn, evse_id):
-    """
-    Look up 'id' in charging_stations for a given evse_id.
-    If not found, insert a minimal record (evse_id) for it.
-    """
-    try:
-        row = conn.execute(
-            text("SELECT id FROM charging_stations WHERE evse_id = :evse_id"),
-            {"evse_id": evse_id}
-        ).fetchone()
-
-        if row:
-            return row[0]
-        else:
-            # Insert minimal row if not present
-            result = conn.execute(
-                text("INSERT INTO charging_stations (evse_id) VALUES (:evse_id)"),
-                {"evse_id": evse_id}
-            )
-            return result.lastrowid
-
-    except SQLAlchemyError as e:
-        print(f"[{datetime.datetime.now()}] Database error in get_station_id: {str(e)}", file=sys.stderr)
-        # Optionally re-raise if you want the script to stop on DB error
-        raise
-
 def poll_status():
     """
     Fetches dynamic statuses and inserts a row into charging_station_status_history
-    for EVERY station on EVERY poll.
+    for every station on every poll.
     """
-    # 1) Fetch the data with basic HTTP error handling
     try:
+        # 1) Fetch the data with basic HTTP error handling
         response = requests.get(STATUS_DATA_URL, timeout=10)
         response.raise_for_status()  # Raises HTTPError if status != 200
     except requests.RequestException as e:
         print(f"[{datetime.datetime.now()}] Error fetching data from {STATUS_DATA_URL}: {str(e)}", file=sys.stderr)
         return  # Skip this poll iteration
 
-    # 2) Parse JSON
     try:
+        # 2) Parse JSON
         data = response.json()
     except ValueError as e:
         print(f"[{datetime.datetime.now()}] Error parsing JSON from response: {str(e)}", file=sys.stderr)
         return  # Skip this poll iteration
 
-    # 3) Insert into DB
     try:
         with engine.begin() as conn:
-            # with engine.begin() auto-commits on success or rolls back on error
-            # Check structure: data should have data["EVSEStatuses"]
+            # Ensure "EVSEStatuses" key exists in the response
             if "EVSEStatuses" not in data:
                 print(f"[{datetime.datetime.now()}] JSON missing 'EVSEStatuses' key. Skipping.", file=sys.stderr)
                 return
 
             for item in data["EVSEStatuses"]:
-                # For safety, item should have "EVSEStatusRecord"
                 if "EVSEStatusRecord" not in item:
                     print(f"[{datetime.datetime.now()}] JSON item missing 'EVSEStatusRecord'. Skipping item.", file=sys.stderr)
                     continue
 
                 for record in item["EVSEStatusRecord"]:
                     evse_id = record.get("EvseID")
-                    current_status = record.get("EVSEStatus")  # "Available", "Occupied", etc.
+                    current_status = record.get("EVSEStatus")
 
                     if not evse_id or not current_status:
                         print(f"[{datetime.datetime.now()}] Missing EvseID or EVSEStatus in record. Skipping.", file=sys.stderr)
                         continue
 
-                    station_id = get_station_id(conn, evse_id)
+                    # Ensure the evse_id exists in charging_stations
                     conn.execute(
                         text("""
-                            INSERT INTO charging_station_status_history (station_id, status)
-                            VALUES (:station_id, :status)
+                            INSERT IGNORE INTO charging_stations (evse_id)
+                            VALUES (:evse_id)
                         """),
-                        {"station_id": station_id, "status": current_status}
+                        {"evse_id": evse_id}
+                    )
+
+                    # Insert the status update into charging_station_status_history
+                    conn.execute(
+                        text("""
+                            INSERT INTO charging_station_status_history (evse_id, status, polled_at)
+                            VALUES (:evse_id, :status, CURRENT_TIMESTAMP)
+                        """),
+                        {"evse_id": evse_id, "status": current_status}
                     )
 
         print(f"[{datetime.datetime.now()}] Polled status for all stations.")
     except SQLAlchemyError as e:
         print(f"[{datetime.datetime.now()}] Database error during poll_status inserts: {str(e)}", file=sys.stderr)
-        # We can continue or re-raise depending on desired behavior
-        # raise
+
 
 def main():
     """
