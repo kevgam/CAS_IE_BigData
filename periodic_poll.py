@@ -103,8 +103,8 @@ def main():
     while True:
         poll_status()
 
-        # Sleep for 1 minute
-        time.sleep(60)
+        # Sleep for 15 minute
+        time.sleep(900)
 
         # Check elapsed time in seconds
         elapsed_seconds = (datetime.datetime.now() - start_time).total_seconds()
